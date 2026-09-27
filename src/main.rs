@@ -128,13 +128,28 @@ fn fork_child(cli: &Cli) -> Result<i32> {
     Ok(tracee_pid)
 }
 
-fn main() -> Result<()> {
+/// Exit with the tracee's status, like strace does: a caller that runs a
+/// command under fstrace (hs's run_command.sh) takes fstrace's exit status as
+/// the command's. `run` returns it instead of exiting itself so that every
+/// output (all BufWriters) is flushed and closed first.
+fn main() {
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Everything fstrace does; returns the exit status to exit with.
+fn run() -> Result<i32> {
     let cli = Cli::parse();
     if let Some(Commands::Install {}) = cli.command {
-        return installer();
+        return installer().map(|()| 0);
     }
     if let Some(Commands::Uninstall {}) = cli.command {
-        return uninstall();
+        return uninstall().map(|()| 0);
     }
 
     // TODO: resolve the path of the executable before the fork
@@ -448,6 +463,9 @@ fn main() -> Result<()> {
     }
 
     let mut status = MaybeUninit::<c_int>::uninit();
+    // Whether one of the waitpids below reaped the tracee, i.e. filled in
+    // `status`. Not when attached to a process that is not our child.
+    let mut reaped = false;
 
     // On SIGTERM, make sure the tracee goes down with us: forward the TERM so
     // it can exit gracefully, and only escalate to SIGKILL if it does not exit
@@ -459,7 +477,9 @@ fn main() -> Result<()> {
         let mut tracee_done = false;
         while std::time::Instant::now() < deadline {
             // > 0 means reaped here; -1 means it was already reaped elsewhere.
-            if unsafe { waitpid(tracee_pid, status.as_mut_ptr(), WNOHANG) } != 0 {
+            let r = unsafe { waitpid(tracee_pid, status.as_mut_ptr(), WNOHANG) };
+            if r != 0 {
+                reaped = r == tracee_pid;
                 tracee_done = true;
                 break;
             }
@@ -470,7 +490,22 @@ fn main() -> Result<()> {
         }
     }
 
-    unsafe { if waitpid(tracee_pid, status.as_mut_ptr(), 0) != tracee_pid {} }
+    if !reaped {
+        reaped = unsafe { waitpid(tracee_pid, status.as_mut_ptr(), 0) } == tracee_pid;
+    }
+    // The shell's convention: the exit code, or 128 + the signal that killed it.
+    let exit_code = if reaped {
+        let status = unsafe { status.assume_init() };
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            128 + libc::WTERMSIG(status)
+        } else {
+            1
+        }
+    } else {
+        0
+    };
 
     // The loop above stops as soon as SIGCHLD fires, but events from the
     // tracee's final syscalls — its last writes — may still sit in the ring
@@ -538,5 +573,5 @@ fn main() -> Result<()> {
         )?;
     }
 
-    Ok(())
+    Ok(exit_code)
 }
